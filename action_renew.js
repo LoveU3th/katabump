@@ -218,7 +218,20 @@ function getUsers() {
     try {
         if (process.env.USERS_JSON) {
             const parsed = JSON.parse(process.env.USERS_JSON);
-            return Array.isArray(parsed) ? parsed : (parsed.users || []);
+            const users = Array.isArray(parsed) ? parsed : (parsed.users || []);
+            
+            // --- GitHub 原生 Secret Masking ---
+            // 通知 GitHub Actions runner 将所有用户名和密码进行掩码，日志中一旦出现均自动替换为 ***
+            users.forEach(u => {
+                if (u.username && u.username.length > 2) {
+                    console.log(`::add-mask::${u.username}`);
+                }
+                if (u.password && u.password.length > 2) {
+                    console.log(`::add-mask::${u.password}`);
+                }
+            });
+
+            return users;
         }
     } catch (e) {
         console.error('解析 USERS_JSON 环境变量错误:', e);
@@ -453,81 +466,46 @@ async function attemptTurnstileCdp(page) {
                         continue;
                     }
 
-                    // A. 在模态框里晃晃鼠标
+                    // 准备点击模态框中的确认 Renew 按钮
+                    const confirmBtn = modal.getByRole('button', { name: 'Renew' });
                     try {
-                        const box = await modal.boundingBox();
-                        if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
+                        await confirmBtn.waitFor({ state: 'visible', timeout: 3000 });
                     } catch (e) { }
 
-                    // B. 找 Turnstile (小重试)
-                    console.log('正在检查 Turnstile (使用 CDP 绕过)...');
-                    let cdpClickResult = false;
-                    for (let findAttempt = 0; findAttempt < 30; findAttempt++) {
-                        cdpClickResult = await attemptTurnstileCdp(page);
-                        if (cdpClickResult) break;
-                        console.log(`   >> [寻找尝试 ${findAttempt + 1}/30] 尚未找到 Turnstile 复选框...`);
-                        await page.waitForTimeout(1000);
-                    }
-
-                    let isTurnstileSuccess = false;
-                    if (cdpClickResult) {
-                        console.log('   >> CDP 点击生效。等待 8秒 Cloudflare 检查...');
-                        await page.waitForTimeout(8000);
-                    } else {
-                        console.log('   >> 重试后仍未确认 Turnstile 复选框。');
-                    }
-
-                    // C. 检查 Success 标志
-                    const frames = page.frames();
-                    for (const f of frames) {
-                        if (f.url().includes('cloudflare')) {
-                            try {
-                                if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                    console.log('   >> 在 Turnstile iframe 中检测到 "Success!"。');
-                                    isTurnstileSuccess = true;
-                                    break;
-                                }
-                            } catch (e) { }
-                        }
-                    }
-
-                    // D. 准备点击确认
-                    const confirmBtn = modal.getByRole('button', { name: 'Renew' });
                     if (await confirmBtn.isVisible()) {
-
-                        // User Requested: Screenshot BEFORE final click
-                        const fs = require('fs');
-                        const path = require('path');
-                        const photoDir = path.join(process.cwd(), 'screenshots');
-                        if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                        const safeUser = user.username.replace(/[^a-z0-9]/gi, '_');
-                        const tsScreenshotName = `${safeUser}_Turnstile_${attempt}.png`;
-                        try {
-                            await page.screenshot({ path: path.join(photoDir, tsScreenshotName), fullPage: true });
-                            console.log(`   >> 📸 快照已保存: ${tsScreenshotName}`);
-                        } catch (e) { }
-
-                        // User Request: 找不到的话这个循环直接下一步点击renew，然后检测有没有Please complete the captcha to continue
-                        console.log('   >> 点击 Renew 确认按钮 (无论 Turnstile 状态如何)...');
+                        console.log('   >> 直接点击模态框中的 Renew 确认按钮...');
                         await confirmBtn.click();
 
                         try {
-                            // 1. Check for Errors (Captcha or Date limit)
                             const startVerifyTime = Date.now();
-                            while (Date.now() - startVerifyTime < 3000) {
-                                // A. Captcha Error
-                                if (await page.getByText('Please complete the captcha to continue').isVisible()) {
-                                    console.log('   >> ⚠️ 检测到错误: "Please complete the captcha".');
-                                    hasCaptchaError = true;
-                                    break;
-                                }
-
-                                // B. Not Renew Time Error
+                            while (Date.now() - startVerifyTime < 5000) {
+                                // 检查 URL 或页面中的未到期提示 (如: You can't renew your server yet...)
+                                const currentUrl = page.url();
                                 const notTimeLoc = page.getByText("You can't renew your server yet");
-                                if (await notTimeLoc.isVisible()) {
-                                    const text = await notTimeLoc.innerText();
-                                    const match = text.match(/as of\s+(.*?)\s+\(/);
-                                    let dateStr = match ? match[1] : 'Unknown Date';
+                                const isNotTime = currentUrl.includes('renew-error') || await notTimeLoc.isVisible().catch(() => false);
+
+                                if (isNotTime) {
+                                    let dateStr = 'Unknown Date';
+
+                                    // 1. 尝试从页面红色警告框获取文本
+                                    try {
+                                        if (await notTimeLoc.first().isVisible({ timeout: 1000 })) {
+                                            const text = await notTimeLoc.first().innerText();
+                                            const match = text.match(/as of\s+([^\(\n\r]+)/i);
+                                            if (match) dateStr = match[1].trim();
+                                        }
+                                    } catch (e) { }
+
+                                    // 2. 如果页面没提取到，从 URL 参数提取 (把 + 转为空格)
+                                    if (dateStr === 'Unknown Date' && currentUrl.includes('renew-error')) {
+                                        try {
+                                            const rawUrlText = currentUrl.replace(/\+/g, ' ');
+                                            const decodedUrl = decodeURIComponent(rawUrlText);
+                                            const matchUrl = decodedUrl.match(/as of\s+([^\(\n\r&]+)/i);
+                                            if (matchUrl) dateStr = matchUrl[1].trim();
+                                        } catch (e) { }
+                                    }
+
                                     console.log(`   >> ⏳ 暂无法续期。下次可用时间: ${dateStr}`);
 
                                     // 截图证明
@@ -541,24 +519,42 @@ async function attemptTurnstileCdp(page) {
 
                                     await sendTelegramMessage(`⏳ *暂无法续期 (跳过)*\n用户: ${user.username}\n原因: 还没到时间\n下次可用: ${dateStr}`, skipShotPath);
 
-                                    renewSuccess = true; // Mark as done to stop retries
+                                    renewSuccess = true; // 标记完成，跳出重试
                                     try {
-                                        const closeBtn = modal.getByLabel('Close');
+                                        const closeBtn = modal.getByRole('button', { name: 'Close' });
                                         if (await closeBtn.isVisible()) await closeBtn.click();
                                     } catch (e) { }
                                     break;
                                 }
-                                await page.waitForTimeout(200);
+
+                                // 检查是否有验证码错误提示
+                                if (await page.getByText('Please complete the captcha to continue').isVisible().catch(() => false)) {
+                                    console.log('   >> ⚠️ 检测到错误: "Please complete the captcha". 需要进行 Turnstile 验证.');
+                                    hasCaptchaError = true;
+                                    break;
+                                }
+
+                                await page.waitForTimeout(300);
                             }
                         } catch (e) { }
 
-                        if (renewSuccess) break; // Break loop if not time yet
+                        if (renewSuccess) break; // 还没到时间，直接结束当前用户
 
                         if (hasCaptchaError) {
-                            console.log('   >> Error found. Refreshing page to reset Turnstile...');
+                            console.log('   >> 尝试通过 Turnstile CDP 绕过验证码...');
+                            for (let findAttempt = 0; findAttempt < 10; findAttempt++) {
+                                const ok = await attemptTurnstileCdp(page);
+                                if (ok) {
+                                    await page.waitForTimeout(3000);
+                                    await confirmBtn.click();
+                                    break;
+                                }
+                                await page.waitForTimeout(1000);
+                            }
+                            console.log('   >> 刷新页面重试...');
                             await page.reload();
                             await page.waitForTimeout(3000);
-                            continue; // 刷新后，重新开始大循环
+                            continue;
                         }
 
                         // F. 检查成功 (模态框消失)
@@ -606,9 +602,8 @@ async function attemptTurnstileCdp(page) {
         const path = require('path');
         const photoDir = path.join(process.cwd(), 'screenshots');
         if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-        // Use safe filename
-        const safeUsername = user.username.replace(/[^a-z0-9]/gi, '_');
-        const screenshotPath = path.join(photoDir, `${safeUsername}.png`);
+        // 使用不包含账号信息的编号作为文件名 (避免公开 Artifact 暴露真实邮箱)
+        const screenshotPath = path.join(photoDir, `user_${i + 1}.png`);
         try {
             await page.screenshot({ path: screenshotPath, fullPage: true });
             console.log(`截图已保存至: ${screenshotPath}`);
