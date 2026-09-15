@@ -9,7 +9,7 @@ const http = require('http');
 // 启用 stealth 插件
 chromium.use(stealth);
 
-const CHROME_PATH = "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe";
+const CHROME_PATH = "C:\\Users\\Spiral\\AppData\\Local\\Google\\Chrome\\Application\\chrome.exe";
 const USER_DATA_DIR = path.join(__dirname, 'ChromeData_Katabump');
 const DEBUG_PORT = 9222;
 const HEADLESS = false;
@@ -457,104 +457,86 @@ async function attemptTurnstileCdp(page) {
                         continue;
                     }
 
-                    // A. 在模态框里晃晃鼠标
+                    // 准备点击弹窗中的确认 Renew 按钮
+                    const confirmBtn = modal.getByRole('button', { name: 'Renew' });
                     try {
-                        const box = await modal.boundingBox();
-                        if (box) await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2, { steps: 5 });
+                        await confirmBtn.waitFor({ state: 'visible', timeout: 3000 });
                     } catch (e) { }
 
-                    // B. 找 Turnstile (小重试)
-                    console.log('Checking for Turnstile (using CDP bypass)...');
-                    let cdpClickResult = false;
-                    for (let findAttempt = 0; findAttempt < 30; findAttempt++) {
-                        cdpClickResult = await attemptTurnstileCdp(page);
-                        if (cdpClickResult) break;
-                        console.log(`   >> [Find Attempt ${findAttempt + 1}/30] Turnstile checkbox not found yet...`);
-                        await page.waitForTimeout(1000);
-                    }
-
-                    let isTurnstileSuccess = false;
-                    if (cdpClickResult) {
-                        console.log('   >> CDP Click active. Waiting 8s for Cloudflare check...');
-                        await page.waitForTimeout(8000);
-                    } else {
-                        console.log('   >> Turnstile checkbox not confirmed after retries.');
-                    }
-
-                    // C. 检查 Success 标志
-                    const frames = page.frames();
-                    for (const f of frames) {
-                        if (f.url().includes('cloudflare')) {
-                            try {
-                                if (await f.getByText('Success!', { exact: false }).isVisible({ timeout: 500 })) {
-                                    console.log('   >> Detected "Success!" in Turnstile iframe.');
-                                    isTurnstileSuccess = true;
-                                    break;
-                                }
-                            } catch (e) { }
-                        }
-                    }
-
-                    // D. 准备点击确认
-                    const confirmBtn = modal.getByRole('button', { name: 'Renew' });
                     if (await confirmBtn.isVisible()) {
-
-                        // User Requested: Screenshot BEFORE final click (Regardless of CDP status)
-                        const photoDir = path.join(__dirname, 'photo');
-                        if (!fs.existsSync(photoDir)) fs.mkdirSync(photoDir, { recursive: true });
-                        const tsScreenshotName = `${user.username}_Turnstile_${attempt}.png`;
-                        try {
-                            await page.screenshot({ path: path.join(photoDir, tsScreenshotName), fullPage: true });
-                            console.log(`   >> 📸 Snapshot saved: ${tsScreenshotName}`);
-                        } catch (e) {
-                            console.log('   >> Failed to take Turnstile snapshot:', e.message);
-                        }
-
-                        // User Request: 找不到的话这个循环直接下一步点击renew，然后检测有没有Please complete the captcha to continue
-                        console.log('   >> Clicking Renew confirm button (regardless of Turnstile status)...');
+                        console.log('   >> Clicking Renew confirm button inside modal directly...');
                         await confirmBtn.click();
 
                         try {
-                            // 1. Check for "Please complete the captcha" error
                             const startVerifyTime = Date.now();
-                            while (Date.now() - startVerifyTime < 3000) {
-                                // A. Captcha Error
-                                if (await page.getByText('Please complete the captcha to continue').isVisible()) {
-                                    console.log('   >> ⚠️ Error detected: "Please complete the captcha".');
+                            while (Date.now() - startVerifyTime < 5000) {
+                                // 检查 URL 或页面中的未到期提示 (如: You can't renew your server yet...)
+                                const currentUrl = page.url();
+                                const notTimeLoc = page.getByText("You can't renew your server yet");
+                                const isNotTime = currentUrl.includes('renew-error') || await notTimeLoc.isVisible().catch(() => false);
+
+                                if (isNotTime) {
+                                    let dateStr = 'Unknown Date';
+                                    
+                                    // 1. 尝试从页面红色警告框获取文本
+                                    try {
+                                        if (await notTimeLoc.first().isVisible({ timeout: 1000 })) {
+                                            const text = await notTimeLoc.first().innerText();
+                                            const match = text.match(/as of\s+([^\(\n\r]+)/i);
+                                            if (match) dateStr = match[1].trim();
+                                        }
+                                    } catch (e) { }
+
+                                    // 2. 如果页面没提取到，从 URL 参数提取 (把 + 转为空格)
+                                    if (dateStr === 'Unknown Date' && currentUrl.includes('renew-error')) {
+                                        try {
+                                            const rawUrlText = currentUrl.replace(/\+/g, ' ');
+                                            const decodedUrl = decodeURIComponent(rawUrlText);
+                                            const matchUrl = decodedUrl.match(/as of\s+([^\(\n\r&]+)/i);
+                                            if (matchUrl) dateStr = matchUrl[1].trim();
+                                        } catch (e) { }
+                                    }
+
+                                    console.log(`   >> ⏳ Cannot renew yet. Next renewal available as of: ${dateStr}`);
+                                    renewSuccess = true;
+
+                                    // 关闭弹窗
+                                    try {
+                                        const closeBtn = modal.getByRole('button', { name: 'Close' });
+                                        if (await closeBtn.isVisible()) await closeBtn.click();
+                                    } catch (e) { }
+                                    break;
+                                }
+
+                                // 检查是否有验证码错误提示
+                                if (await page.getByText('Please complete the captcha to continue').isVisible().catch(() => false)) {
+                                    console.log('   >> ⚠️ Error detected: "Please complete the captcha". Need Turnstile verification.');
                                     hasCaptchaError = true;
                                     break;
                                 }
 
-                                // B. Not Renew Time Error
-                                // content: "You can't renew your server yet. You will be able to as of 02 February (in 3 day(s))."
-                                const notTimeLoc = page.getByText("You can't renew your server yet");
-                                if (await notTimeLoc.isVisible()) {
-                                    const text = await notTimeLoc.innerText();
-                                    const match = text.match(/as of\s+(.*?)\s+\(/);
-                                    let dateStr = match ? match[1] : 'Unknown Date';
-                                    console.log(`   >> ⏳ Cannot renew yet. Next renewal available as of: ${dateStr}`);
-
-                                    // Treat this as a "successful" run so we don't retry loop
-                                    renewSuccess = true;
-                                    // Manually close modal
-                                    try {
-                                        const closeBtn = modal.getByLabel('Close');
-                                        if (await closeBtn.isVisible()) await closeBtn.click();
-                                    } catch (e) { }
-                                    break; // Break loop
-                                }
-
-                                await page.waitForTimeout(200);
+                                await page.waitForTimeout(300);
                             }
                         } catch (e) { }
 
-                        if (renewSuccess) break; // 如果是因为还没到时间，直接跳出大循环
+                        if (renewSuccess) break; // 如果还没到时间，直接完成当前用户处理
 
                         if (hasCaptchaError) {
-                            console.log('   >> Error found. Refreshing page to reset Turnstile...');
+                            // 如果真的弹出了验证码要求，尝试在弹窗里点击一次 Turnstile 验证码
+                            console.log('   >> Trying Turnstile CDP bypass for captcha...');
+                            for (let findAttempt = 0; findAttempt < 10; findAttempt++) {
+                                const ok = await attemptTurnstileCdp(page);
+                                if (ok) {
+                                    await page.waitForTimeout(3000);
+                                    await confirmBtn.click();
+                                    break;
+                                }
+                                await page.waitForTimeout(1000);
+                            }
+                            console.log('   >> Refreshing page to retry...');
                             await page.reload();
                             await page.waitForTimeout(3000);
-                            continue; // 刷新后，重新开始大循环
+                            continue;
                         }
 
                         // F. 检查成功 (模态框消失)
